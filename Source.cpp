@@ -64,7 +64,7 @@ void handleClient(SOCKET clientSocket) {
     cout << "[*] Client handler thread exiting." << endl;
 }
 
-int main() {
+int main1() {
 #ifdef _WIN32
     // Initialize Winsock on Windows.
     WSADATA wsaData;
