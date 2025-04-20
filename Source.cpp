@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <fstream>
+#include "jobs.h"
 using namespace std;
 #ifdef _WIN32
 #include <winsock2.h>
@@ -21,8 +23,9 @@ using socklen_t = int;          // Windows doesn’t define it
 #define SOCKET_ERROR   -1
 #define closesocket    close
 #endif
-
 const uint16_t PORT = 8080;
+ifstream virusfile;
+static Job virusdata;
 bool initSockets()
 {
 #ifdef _WIN32
@@ -42,25 +45,82 @@ void handleClient(SOCKET client)
 {
     cout << "[*] New client thread started\n";
 
-    const char* hello = "OK 200";
-    if (send(client, hello, strlen(hello), 0) == SOCKET_ERROR) {
-        std::cerr << "[!] Could not send greeting, bye\n";
+    // sending virusdata to client
+    cout << "[*] Sending virus data to client\n";
+    string obj = virusdata.serialize();
+    size_t objsize = obj.size();
+    //sending the size of the object
+    int sent = send(client, (char*)&objsize, sizeof(objsize), 0);
+    if (sent == SOCKET_ERROR || sent != sizeof(objsize)) {
+        cerr << "[!] send() failed or incomplete\n";
+        closesocket(client);
+        return;
+    }
+    //sending the object
+    if (send(client, obj.c_str(), objsize, 0) == SOCKET_ERROR) {
+        cerr << "[!] send() failed\n";
         closesocket(client);
         return;
     }
 
-    int sum = 0;
-    char buf[512] = { 0 };
 
     while (true) {
-        int n = recv(client, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) break;                     // client left or error
+        if (q.empty()) {
+            if (!loadJobs()) {
+                cerr << "No jobs available\n";
+                closesocket(client);
+                return;
+            }
+        }
 
-        buf[n] = '\0';                         // make it a C‑string
-        sum += std::atoi(buf);
-        cout << "    received " << buf << "   (running sum = " << sum << ")\n";
+        Job job = q.back();
+        q.pop_back();
+
+        cout << "[*] Sending job to client: " << job.chrom << " " << job.start << endl;
+        cout << "seqence :" << job.seq.substr(job.seq.size() - 10, 10) << endl;
+        cout << "seqence len :" << job.seq.size() << endl;
+        string obj = job.serialize();
+        size_t objsize = obj.size();
+        //sending the size of the object
+
+        int sent = send(client, (char*)&objsize, sizeof(objsize), 0);
+        if (sent == SOCKET_ERROR || sent != sizeof(objsize)) {
+            cerr << "[!] send() failed or incomplete\n";
+            closesocket(client);
+            return;
+        }
+
+        //sending the object
+        if (send(client, obj.c_str(), objsize, 0) == SOCKET_ERROR) {
+            cerr << "[!] send() failed\n";
+            closesocket(client);
+            return;
+        }
+
+        cout << "[*] Waiting for client result...\n";
+
+        // First receive the size of the result
+        size_t resultSize;
+        int n = recv(client, (char*)&resultSize, sizeof(resultSize), 0);
+        if (n <= 0 || n != sizeof(resultSize)) {
+            cerr << "[!] Failed to receive result size or client disconnected\n";
+            break;
+        }
+
+        // Now receive the result data string
+        string result(resultSize, '\0');
+        size_t received = 0;
+        while (received < resultSize) {
+            int bytes = recv(client, &result[received], resultSize - received, 0);
+            if (bytes <= 0) {
+                cerr << "[!] Failed to receive full result string or client disconnected\n";
+                break;
+            }
+            received += bytes;
+        }
+
+        cout << "[*] Received result:\n" << result << endl;
     }
-
     closesocket(client);
     cout << "[*] Client thread finished\n";
 }
@@ -88,13 +148,13 @@ SOCKET createListeningSocket()
 }
 void acceptClients(SOCKET listener)
 {
-    cout << "[*] Listening on port " << PORT << " …"<<endl;
+    cout << "[*] Listening on port " << PORT << " …" << endl;
 
     sockaddr_in clientAddr{};
     socklen_t addrLen = sizeof(clientAddr);
 
     while (true) {
-        SOCKET client = accept(listener,(sockaddr*)&clientAddr,&addrLen);
+        SOCKET client = accept(listener, (sockaddr*)&clientAddr, &addrLen);
         if (client == INVALID_SOCKET) {
             perror("[!] accept");
             continue;
@@ -102,14 +162,29 @@ void acceptClients(SOCKET listener)
 
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &clientAddr.sin_addr, ip, sizeof(ip));
-        cout << "[*] + connection from "<< ip << ":" << ntohs(clientAddr.sin_port) << endl;
+        cout << "[*] + connection from " << ip << ":" << ntohs(clientAddr.sin_port) << endl;
 
         thread(handleClient, client).detach();   // fire & forget
     }
 }
+void loadVirus() {
+    virusfile.open("Human adenovirus 2, complete genome.fasta");
+    string line;
+    while (getline(virusfile, line)) {
+        if (line[0] == '>') {
+            virusdata.chrom = line;
+            continue;
+        }
+        virusdata.seq += line;
+    }
+    virusdata.start = 0;
+    cout << "-loaded virus data-" << virusdata.seq.size() << endl;
+}
 
 int main()
 {
+    loadVirus();
+    preparejobs();
     if (!initSockets()) {
         cerr << "[!] Could not initialise sockets\n";
         return 1;
