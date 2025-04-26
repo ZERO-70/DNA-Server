@@ -1,16 +1,17 @@
-﻿// simple_server.cpp  ── a minimal cross‑platform demo
-#include <iostream>
+﻿#include <iostream>
 #include <string>
 #include <vector>
 #include <thread>
 #include <fstream>
-#include "jobs.h"
+#include "TaskManager.h"
+#include <mutex>
+#include <memory>
 using namespace std;
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib,"ws2_32.lib")
-using socklen_t = int;          // Windows doesn’t define it
+using socklen_t = int;          // Windows doesn't define it
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -24,8 +25,62 @@ using socklen_t = int;          // Windows doesn’t define it
 #define closesocket    close
 #endif
 const uint16_t PORT = 8080;
-ifstream virusfile;
-static Job virusdata;
+
+// Socket class to wrap socket functionality
+class Socket {
+private:
+    SOCKET socketFd;
+    string ipAddress;
+    uint16_t port;
+
+public:
+    Socket(SOCKET fd, const string& ip, uint16_t p) : socketFd(fd), ipAddress(ip), port(p) {}
+    
+    ~Socket() {
+        // Close socket if still open
+        if (socketFd != INVALID_SOCKET) {
+            closesocket(socketFd);
+            socketFd = INVALID_SOCKET;
+        }
+    }
+
+    SOCKET getSocket() const { return socketFd; }
+    string getIpAddress() const { return ipAddress; }
+    uint16_t getPort() const { return port; }
+    
+    // Prevent copying
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
+};
+
+// Functions to manage the socket vector
+vector<shared_ptr<Socket>> socketRefs;
+mutex socketRefs_mutex;
+
+void addSocket(shared_ptr<Socket> socket) {
+    lock_guard<mutex> lock(socketRefs_mutex);
+    socketRefs.push_back(socket);
+    cout << "[*] Device connected! Total connected devices: " << socketRefs.size() << endl;
+}
+
+void removeSocket(shared_ptr<Socket> socket) {
+    lock_guard<mutex> lock(socketRefs_mutex);
+    auto it = find_if(socketRefs.begin(), socketRefs.end(),
+        [&socket](const shared_ptr<Socket>& s) {
+            return s->getSocket() == socket->getSocket();
+        });
+    
+    if (it != socketRefs.end()) {
+        socketRefs.erase(it);
+        cout << "[*] Device disconnected! Total connected devices: " << socketRefs.size() << endl;
+    }
+}
+
+size_t getConnectedDeviceCount() {
+    lock_guard<mutex> lock(socketRefs_mutex);
+    return socketRefs.size();
+}
+
 bool initSockets()
 {
 #ifdef _WIN32
@@ -35,95 +90,118 @@ bool initSockets()
     return true;                   // nothing to do on Linux / macOS
 #endif
 }
+
 void cleanupSockets()
 {
 #ifdef _WIN32
     WSACleanup();
 #endif
 }
-void handleClient(SOCKET client)
+
+void handleClient(shared_ptr<Socket> clientSocket)
 {
     cout << "[*] New client thread started\n";
 
-    // sending virusdata to client
-    cout << "[*] Sending virus data to client\n";
-    string obj = virusdata.serialize();
-    size_t objsize = obj.size();
-    //sending the size of the object
-    int sent = send(client, (char*)&objsize, sizeof(objsize), 0);
-    if (sent == SOCKET_ERROR || sent != sizeof(objsize)) {
-        cerr << "[!] send() failed or incomplete\n";
-        closesocket(client);
-        return;
-    }
-    //sending the object
-    if (send(client, obj.c_str(), objsize, 0) == SOCKET_ERROR) {
-        cerr << "[!] send() failed\n";
-        closesocket(client);
-        return;
-    }
-
-
     while (true) {
-        if (q.empty()) {
-            if (!loadJobs()) {
+        if (taskQ.empty()) { // agar task queue khali ho jaye to or task load karo 
+            if (!loadTasks()) {// or agar or tasks hi nhi bache to return kar do, matlab client se disconnect
                 cerr << "No jobs available\n";
-                closesocket(client);
+                removeSocket(clientSocket);
                 return;
             }
         }
 
-        Job job = q.back();
-        q.pop_back();
+        Task task; // task ka object
+        {
+            lock_guard<std::mutex> lk(jobs_mutex); // mutex lock karo
+            task = taskQ.front();  // taskQ se front wala task lo
+            taskQ.pop(); // taskQ se front wala task hata do
+        }   
+        cout << "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" << endl;
+        cout << "Sending task to client: " << task.human.chrom << " " << task.human.start << endl;
+        cout << "seqence :" << task.human.seq.substr(task.human.seq.size() - 10, 10) << endl;
+        cout << "seqence len :" << task.human.seq.size() << endl;
+        cout << "virus chunk :" << task.vIndex << endl;
+        cout << "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@" << endl;
 
-        cout << "[*] Sending job to client: " << job.chrom << " " << job.start << endl;
-        cout << "seqence :" << job.seq.substr(job.seq.size() - 10, 10) << endl;
-        cout << "seqence len :" << job.seq.size() << endl;
-        string obj = job.serialize();
+        string obj = task.serialize(); // task ko serialize karo
         size_t objsize = obj.size();
-        //sending the size of the object
 
-        int sent = send(client, (char*)&objsize, sizeof(objsize), 0);
+        // task ka size send karo
+        int sent = send(clientSocket->getSocket(), (char*)&objsize, sizeof(objsize), 0);
         if (sent == SOCKET_ERROR || sent != sizeof(objsize)) {
             cerr << "[!] send() failed or incomplete\n";
-            closesocket(client);
+            removeSocket(clientSocket);
             return;
         }
 
-        //sending the object
-        if (send(client, obj.c_str(), objsize, 0) == SOCKET_ERROR) {
+        // task ka data send karo
+        if (send(clientSocket->getSocket(), obj.c_str(), objsize, 0) == SOCKET_ERROR) {
             cerr << "[!] send() failed\n";
-            closesocket(client);
+            removeSocket(clientSocket);
             return;
         }
 
         cout << "[*] Waiting for client result...\n";
 
-        // First receive the size of the result
-        size_t resultSize;
-        int n = recv(client, (char*)&resultSize, sizeof(resultSize), 0);
-        if (n <= 0 || n != sizeof(resultSize)) {
+        // result ka size recieve karo
+        uint32_t netLen;
+        int n = recv(clientSocket->getSocket(), (char*)&netLen, sizeof(netLen), MSG_WAITALL);
+        if (n <= 0 || n != sizeof(netLen)) { // agar task ka size nahi mila ya client disconnect ho gaya
             cerr << "[!] Failed to receive result size or client disconnected\n";
+            {
+                lock_guard<std::mutex> lk(jobs_mutex); // mutex lock karo
+                taskQ.emplace(task); // task ko wapas queue me daal do
+                cerr << "[!] placing back the pending task\n";
+            }
             break;
         }
 
-        // Now receive the result data string
+        uint32_t resultSize = ntohl(netLen); // convert to host byte order
+        // kya kuch or ajeed data to nhi wapis aaya
+        if (resultSize > 1000000) { // sanity check (1MB max)
+            cerr << "[!] Suspicious result size, aborting\n";
+            cout << "result size : " << resultSize << endl;
+            {
+                lock_guard<std::mutex> lk(jobs_mutex); // mutex lock karo
+                taskQ.emplace(task); // task ko wapas queue me daal do
+            }
+            break;
+        }   
+
+        // result ka data recieve karo
         string result(resultSize, '\0');
         size_t received = 0;
+        bool success = true;
         while (received < resultSize) {
-            int bytes = recv(client, &result[received], resultSize - received, 0);
+            int bytes = recv(clientSocket->getSocket(), &result[received], resultSize - received, 0);
             if (bytes <= 0) {
                 cerr << "[!] Failed to receive full result string or client disconnected\n";
+                success = false;
+                {
+                    lock_guard<std::mutex> lk(jobs_mutex); // mutex lock karo
+                    taskQ.emplace(task); // task ko wapas queue me daal do
+                    cerr << "[!] placing back the pending task -----\n";
+                }
+                // breaking from innner loop
                 break;
             }
             received += bytes;
         }
+        // breaking from outer loop
+        if (!success) { // safety ke liye dobara se task ko queue me daal do
+            lock_guard<std::mutex> lk(jobs_mutex);
+            taskQ.emplace(task);
+            cerr << "[!] placing back the pending task -----\n";
+            break;
+        }       // now breaks outer loop too
 
         cout << "[*] Received result:\n" << result << endl;
     }
-    closesocket(client);
+    removeSocket(clientSocket);
     cout << "[*] Client thread finished\n";
 }
+
 SOCKET createListeningSocket()
 {
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
@@ -135,10 +213,12 @@ SOCKET createListeningSocket()
     addr.sin_port = htons(PORT);
 
     if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        cerr << "[!] bind() failed\n";
+        perror("[!] bind");             
+        std::cerr << "errno = " << errno << '\n';
         closesocket(s);
         return INVALID_SOCKET;
     }
+
     if (listen(s, SOMAXCONN) == SOCKET_ERROR) {
         cerr << "[!] listen() failed\n";
         closesocket(s);
@@ -146,6 +226,7 @@ SOCKET createListeningSocket()
     }
     return s;
 }
+
 void acceptClients(SOCKET listener)
 {
     cout << "[*] Listening on port " << PORT << " …" << endl;
@@ -164,26 +245,17 @@ void acceptClients(SOCKET listener)
         inet_ntop(AF_INET, &clientAddr.sin_addr, ip, sizeof(ip));
         cout << "[*] + connection from " << ip << ":" << ntohs(clientAddr.sin_port) << endl;
 
-        thread(handleClient, client).detach();   // fire & forget
+        auto clientSocket = make_shared<Socket>(client, ip, ntohs(clientAddr.sin_port));
+        addSocket(clientSocket);
+
+        thread(handleClient, clientSocket).detach();   // fire & forget
     }
-}
-void loadVirus() {
-    virusfile.open("Human adenovirus 2, complete genome.fasta");
-    string line;
-    while (getline(virusfile, line)) {
-        if (line[0] == '>') {
-            virusdata.chrom = line;
-            continue;
-        }
-        virusdata.seq += line;
-    }
-    virusdata.start = 0;
-    cout << "-loaded virus data-" << virusdata.seq.size() << endl;
 }
 
 int main()
 {
     loadVirus();
+    makeVirusChunks();
     preparejobs();
     if (!initSockets()) {
         cerr << "[!] Could not initialise sockets\n";
@@ -196,9 +268,9 @@ int main()
         return 1;
     }
 
-    acceptClients(listener);          // never returns
+    acceptClients(listener);          
 
-    closesocket(listener);            // not reached, but tidy
+    closesocket(listener);            
     cleanupSockets();
     return 0;
 }
